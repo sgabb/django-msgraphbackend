@@ -130,6 +130,12 @@ def header_of(request, name: str) -> str | None:
     return request.headers.get(name.capitalize())
 
 
+def body_of(part) -> bytes:
+    """Returns the decoded text of a MIME part without its trailing line break."""
+    # Django 6 ends a text part with a line break, Django 5 does not.
+    return part.get_payload(decode=True).rstrip(b"\r\n")
+
+
 class SendMailTests(unittest.TestCase):
     """The single request that sends everything that is small enough."""
 
@@ -150,9 +156,9 @@ class SendMailTests(unittest.TestCase):
         self.assertEqual(sent["From"], "sender@example.com")
         self.assertEqual(sent["To"], "recipient@example.com")
         body, attachment = sent.get_payload()
-        self.assertEqual(body.get_payload(decode=True), b"Body")
+        self.assertEqual(body_of(body), b"Body")
         self.assertEqual(attachment.get_filename(), "notes.txt")
-        self.assertEqual(attachment.get_payload(decode=True), b"a note")
+        self.assertEqual(body_of(attachment), b"a note")
 
     def test_sender_is_looked_up_when_no_user_id_is_configured(self):
         graph = FakeGraph()
@@ -216,7 +222,7 @@ class SendLargeMailTests(unittest.TestCase):
         self.assertEqual(draft["Subject"], "Subject")
         self.assertEqual(draft["To"], "recipient@example.com")
         self.assertFalse(draft.is_multipart())
-        self.assertEqual(draft.get_payload(decode=True), b"Body")
+        self.assertEqual(body_of(draft), b"Body")
 
     def test_attachments_are_posted_to_the_draft(self):
         graph = FakeGraph()
