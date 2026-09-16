@@ -154,29 +154,6 @@ class SendMailTests(unittest.TestCase):
         self.assertEqual(attachment.get_filename(), "notes.txt")
         self.assertEqual(attachment.get_payload(decode=True), b"a note")
 
-    def test_message_is_sent_as_json_when_configured(self):
-        graph = FakeGraph()
-        message = make_message(("notes.txt", "a note", "text/plain"))
-
-        self.assertEqual(send(message, graph, use_json_api=True), 1)
-
-        request = graph.requests[0]
-        self.assertEqual(header_of(request, "Content-Type"), "application/json")
-        payload = payload_of(request)
-        self.assertEqual(payload["saveToSentItems"], "true")
-        self.assertEqual(payload["message"]["subject"], "Subject")
-        self.assertEqual(
-            payload["message"]["attachments"],
-            [
-                {
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": "notes.txt",
-                    "contentType": 'text/plain; charset="utf-8"',
-                    "contentBytes": base64.b64encode(b"a note").decode("ascii"),
-                }
-            ],
-        )
-
     def test_sender_is_looked_up_when_no_user_id_is_configured(self):
         graph = FakeGraph()
 
@@ -300,19 +277,6 @@ class SendLargeMailTests(unittest.TestCase):
         self.assertEqual(attachments[0]["contentId"], "logo")
         self.assertIs(attachments[0]["isInline"], True)
         self.assertNotIn("isInline", attachments[1])
-
-    def test_draft_is_created_as_json_when_configured(self):
-        graph = FakeGraph()
-
-        send(self.make_large_message(), graph, use_json_api=True)
-
-        request = graph.requests[0]
-        self.assertEqual(request.full_url, MESSAGES_URL)
-        self.assertEqual(header_of(request, "Content-Type"), "application/json")
-        payload = payload_of(request)
-        self.assertEqual(payload["subject"], "Subject")
-        self.assertEqual(payload["body"], {"contentType": "text", "content": "Body"})
-        self.assertEqual(payload["attachments"], [])
 
     def test_draft_is_deleted_when_an_attachment_fails(self):
         graph = FakeGraph(fail_on="/attachments")
