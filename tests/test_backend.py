@@ -9,17 +9,22 @@ API without any network traffic.
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import unittest
 import urllib.error
 from email import message_from_bytes
 from email.mime.image import MIMEImage
+from typing import TYPE_CHECKING
 from unittest import mock
 
 from django.core.mail import EmailMessage, EmailMultiAlternatives
 
 from msgraphbackend import MSGraphBackend
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 TOKEN_URL = "https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token"
 USER_URL = "https://graph.microsoft.com/v1.0/users/user-id"
@@ -136,6 +141,25 @@ def body_of(part) -> bytes:
     return part.get_payload(decode=True).rstrip(b"\r\n")
 
 
+@contextlib.contextmanager
+def encoded_attachment_counts() -> Iterator[list[int]]:
+    """
+    Records how many attachments each message had when the backend encoded it.
+
+    The draft of a large message is encoded with its attachments removed and
+    restored afterwards, so the count has to be taken while it is encoded.
+    """
+    counts: list[int] = []
+    encode_message = MSGraphBackend._encode_message
+
+    def spy(backend, email_message):
+        counts.append(len(email_message.attachments))
+        return encode_message(backend, email_message)
+
+    with mock.patch.object(MSGraphBackend, "_encode_message", spy):
+        yield counts
+
+
 class SendMailTests(unittest.TestCase):
     """The single request that sends everything that is small enough."""
 
@@ -159,6 +183,16 @@ class SendMailTests(unittest.TestCase):
         self.assertEqual(body_of(body), b"Body")
         self.assertEqual(attachment.get_filename(), "notes.txt")
         self.assertEqual(body_of(attachment), b"a note")
+
+    def test_message_is_encoded_once(self):
+        graph = FakeGraph()
+        message = make_message(("notes.txt", b"a note", "text/plain"))
+
+        with encoded_attachment_counts() as counts:
+            self.assertEqual(send(message, graph), 1)
+
+        self.assertEqual(counts, [1])
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
 
     def test_sender_is_looked_up_when_no_user_id_is_configured(self):
         graph = FakeGraph()
@@ -223,6 +257,32 @@ class SendLargeMailTests(unittest.TestCase):
         self.assertEqual(draft["To"], "recipient@example.com")
         self.assertFalse(draft.is_multipart())
         self.assertEqual(body_of(draft), b"Body")
+
+    def test_oversized_attachments_are_not_encoded_for_the_single_request(self):
+        graph = FakeGraph()
+        # The attachments alone are too large, so only the draft is encoded.
+        message = self.make_large_message()
+
+        with encoded_attachment_counts() as counts:
+            self.assertEqual(send(message, graph), 1)
+
+        self.assertEqual(counts, [0])
+        self.assertEqual(graph.urls[0], MESSAGES_URL)
+
+    def test_message_near_the_limit_is_measured_exactly(self):
+        graph = FakeGraph()
+        # The attachments alone leave room for the message, but encoded, the
+        # message exceeds the limit, so it is encoded whole before the draft.
+        message = make_message(
+            ("first.bin", b"\x01" * 1_300_000, "application/octet-stream"),
+            ("second.bin", b"\x02" * 1_300_000, "application/octet-stream"),
+        )
+
+        with encoded_attachment_counts() as counts:
+            self.assertEqual(send(message, graph), 1)
+
+        self.assertEqual(counts, [2, 0])
+        self.assertEqual(graph.urls[0], MESSAGES_URL)
 
     def test_attachments_are_posted_to_the_draft(self):
         graph = FakeGraph()

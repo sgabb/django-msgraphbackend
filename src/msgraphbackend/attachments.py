@@ -81,6 +81,28 @@ def iter_attachments(email_message: EmailMessage) -> Iterator[GraphAttachment]:
             yield _from_triple(filename, content, mimetype, encoding)
 
 
+def attachments_size(email_message: EmailMessage) -> int:
+    """
+    Returns a lower bound of the bytes the attachments take up in the MIME message.
+
+    Django transfer-encodes an attachment when it serializes the message, which
+    never makes it smaller, so the size of what was attached is a bound that
+    costs nothing to compute: nothing is encoded or decoded for it. An
+    attachment whose size is unknown, such as an attached email object, counts
+    as zero.
+    """
+    total = 0
+    for attachment in email_message.attachments:
+        if isinstance(attachment, MIMEBase):
+            # The payload of a MIME part is already transfer-encoded.
+            content = attachment.get_payload()
+        else:
+            _, content, _ = attachment
+        if isinstance(content, (str, bytes, bytearray)):
+            total += len(content)
+    return total
+
+
 def iter_chunks(content: bytes, chunk_size: int) -> Iterator[tuple[int, int, bytes]]:
     """
     Splits the content into the byte ranges of an upload session.

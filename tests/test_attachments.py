@@ -9,18 +9,28 @@ from email.mime.image import MIMEImage
 
 from django.core.mail import EmailMessage
 
-from msgraphbackend.attachments import GraphAttachment, iter_attachments, iter_chunks
+from msgraphbackend.attachments import (
+    GraphAttachment,
+    attachments_size,
+    iter_attachments,
+    iter_chunks,
+)
 
 
-def attachments_of(*attachments) -> list[GraphAttachment]:
-    """Returns the Graph attachments of a message with the given attachments."""
+def message_with(*attachments) -> EmailMessage:
+    """Returns a message with the given attachments."""
     message = EmailMessage(subject="Subject", body="Body", to=["to@example.com"])
     for attachment in attachments:
         if isinstance(attachment, MIMEBase):
             message.attach(attachment)
         else:
             message.attach(*attachment)
-    return list(iter_attachments(message))
+    return message
+
+
+def attachments_of(*attachments) -> list[GraphAttachment]:
+    """Returns the Graph attachments of a message with the given attachments."""
+    return list(iter_attachments(message_with(*attachments)))
 
 
 class IterAttachmentsTests(unittest.TestCase):
@@ -105,6 +115,40 @@ class GraphAttachmentTests(unittest.TestCase):
                 "isInline": True,
             },
         )
+
+
+class AttachmentsSizeTests(unittest.TestCase):
+    def test_binary_attachment(self):
+        message = message_with(("report.pdf", b"%PDF-1.7", "application/pdf"))
+
+        self.assertEqual(attachments_size(message), 8)
+
+    def test_text_attachment_counts_its_characters(self):
+        message = message_with(("notes.txt", "Grüße", "text/plain"))
+
+        self.assertEqual(attachments_size(message), 5)
+
+    def test_mime_part_counts_its_encoded_payload(self):
+        part = MIMEImage(b"\x89PNG", "png")
+
+        self.assertEqual(attachments_size(message_with(part)), len(part.get_payload()))
+
+    def test_attached_email_object_counts_as_zero(self):
+        attached = EmailMessage(subject="Attached", body="Body", to=["to@example.com"])
+        message = message_with(("attached.eml", attached, "message/rfc822"))
+
+        self.assertEqual(attachments_size(message), 0)
+
+    def test_several_attachments_are_summed(self):
+        message = message_with(
+            ("first.bin", b"12", "application/octet-stream"),
+            ("second.bin", b"345", "application/octet-stream"),
+        )
+
+        self.assertEqual(attachments_size(message), 5)
+
+    def test_message_without_attachments(self):
+        self.assertEqual(attachments_size(message_with()), 0)
 
 
 class IterChunksTests(unittest.TestCase):

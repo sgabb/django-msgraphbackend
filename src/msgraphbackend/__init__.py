@@ -15,7 +15,12 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.core.mail.backends.base import BaseEmailBackend
 
-from .attachments import GraphAttachment, iter_attachments, iter_chunks
+from .attachments import (
+    GraphAttachment,
+    attachments_size,
+    iter_attachments,
+    iter_chunks,
+)
 
 if TYPE_CHECKING:
     import http.client
@@ -134,8 +139,8 @@ class MSGraphBackend(BaseEmailBackend):
         user_id = self.user_id or self._get_user(email_message.from_email)
         if user_id is None:
             return False
-        message = self._encode_message(email_message)
-        if len(message) > self.MAX_SENDMAIL_SIZE:
+        message = self._encode_for_sendmail(email_message)
+        if message is None:
             # Too large for a single request, so send it the long way around.
             return self._send_large(email_message, user_id)
         url = f"https://graph.microsoft.com/v1.0/users/{user_id}/sendMail"
@@ -300,6 +305,23 @@ class MSGraphBackend(BaseEmailBackend):
                 email_message.message(policy=SMTPUTF8).as_bytes()  # pyrefly: ignore
             )
         return base64.b64encode(email_message.message().as_bytes())
+
+    def _encode_for_sendmail(self, email_message: EmailMessage) -> bytes | None:
+        """
+        Returns the encoded message if it fits into a single sendMail request.
+
+        Encoding the message grows it by a third, and its attachments are in it
+        at least at their own size, so once they alone reach three quarters of
+        the limit the message cannot fit. Checking that first spares a large
+        attachment from being encoded only to find out that it has to be
+        uploaded separately anyway. Everything else is measured exactly.
+        """
+        if attachments_size(email_message) * 4 // 3 > self.MAX_SENDMAIL_SIZE:
+            return None
+        message = self._encode_message(email_message)
+        if len(message) > self.MAX_SENDMAIL_SIZE:
+            return None
+        return message
 
     def _prepare_draft_message(self, email_message: EmailMessage) -> bytes:
         """
