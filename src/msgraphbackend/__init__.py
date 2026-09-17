@@ -21,6 +21,7 @@ from .attachments import (
     iter_attachments,
     iter_chunks,
 )
+from .message import graph_message, sendmail_payload
 
 if TYPE_CHECKING:
     import http.client
@@ -59,8 +60,10 @@ class MSGraphToken:
 class MSGraphBackend(BaseEmailBackend):
     """A Django email backend that sends emails through the Microsoft Graph API."""
 
-    # Graph rejects a sendMail request whose body exceeds about 4 MB. Messages
-    # above this limit are sent as a draft with separately uploaded attachments.
+    # Graph used to reject a sendMail request whose body exceeds about 4 MB, and
+    # still documents that limit for S/MIME payloads. Messages above this limit
+    # are sent as a draft with separately uploaded attachments. The setting
+    # MSGRAPH_MAX_SENDMAIL_SIZE overrides this default.
     MAX_SENDMAIL_SIZE = 3_500_000
     # Graph only accepts an attachment that is posted in one request if the file
     # is smaller than 3 MB. Anything else needs an upload session.
@@ -74,6 +77,9 @@ class MSGraphBackend(BaseEmailBackend):
         client_id: str | None = None,
         client_secret: str | None = None,
         user_id: str | None = None,
+        use_json_api: bool = False,
+        max_sendmail_size: int | None = None,
+        always_use_sendmail: bool = False,
         fail_silently: bool = False,
         **kwargs,
     ) -> None:
@@ -88,6 +94,14 @@ class MSGraphBackend(BaseEmailBackend):
         self.client_id = client_id or settings.MSGRAPH_CLIENT_ID
         self.client_secret = client_secret or settings.MSGRAPH_CLIENT_SECRET
         self.user_id = getattr(settings, "MSGRAPH_USER_ID", user_id)
+        self.use_json_api = getattr(settings, "MSGRAPH_USE_JSON_API", use_json_api)
+        self.max_sendmail_size = (
+            getattr(settings, "MSGRAPH_MAX_SENDMAIL_SIZE", max_sendmail_size)
+            or self.MAX_SENDMAIL_SIZE
+        )
+        self.always_use_sendmail = getattr(
+            settings, "MSGRAPH_ALWAYS_USE_SENDMAIL", always_use_sendmail
+        )
         self._token: MSGraphToken | None = None
         self.open()
 
@@ -144,7 +158,7 @@ class MSGraphBackend(BaseEmailBackend):
             # Too large for a single request, so send it the long way around.
             return self._send_large(email_message, user_id)
         url = f"https://graph.microsoft.com/v1.0/users/{user_id}/sendMail"
-        headers = self._prepare_headers("text/plain")
+        headers = self._prepare_headers(self.content_type)
         request = urllib.request.Request(url, data=message, headers=headers)
         response = self._urlopen(
             request, "Failed to send email via Microsoft Graph API."
@@ -153,7 +167,7 @@ class MSGraphBackend(BaseEmailBackend):
 
     def _send_large(self, email_message: EmailMessage, user_id: str) -> bool:
         """
-        A helper method that sends a message exceeding MAX_SENDMAIL_SIZE.
+        A helper method that sends a message exceeding max_sendmail_size.
 
         Such a message cannot be sent in a single request, so it is created as a
         draft without its attachments first. Every attachment is then uploaded
@@ -181,7 +195,7 @@ class MSGraphBackend(BaseEmailBackend):
     def _create_draft(self, email_message: EmailMessage, user_id: str) -> str | None:
         """Creates the message without its attachments and returns its id."""
         url = f"https://graph.microsoft.com/v1.0/users/{user_id}/messages"
-        headers = self._prepare_headers("text/plain")
+        headers = self._prepare_headers(self.content_type)
         data = self._prepare_draft_message(email_message)
         request = urllib.request.Request(url, data=data, headers=headers)
         response = self._urlopen(
@@ -287,6 +301,11 @@ class MSGraphBackend(BaseEmailBackend):
             fail_silently=True,
         )
 
+    @property
+    def content_type(self) -> str:
+        """The Content-Type that tells Graph in which format a message arrives."""
+        return "application/json" if self.use_json_api else "text/plain"
+
     def _prepare_headers(self, content_type: str) -> dict:
         """Prepare the headers for a request against the Microsoft Graph API."""
         if not self._token:
@@ -296,7 +315,27 @@ class MSGraphBackend(BaseEmailBackend):
             "Authorization": self._token.authorization_value,
         }
 
-    def _encode_message(self, email_message: EmailMessage) -> bytes:
+    def _encode_message(
+        self, email_message: EmailMessage, *, for_draft: bool = False
+    ) -> bytes:
+        """
+        Returns the body of a request that carries the message, in the
+        configured format.
+
+        In the MIME format the same base64 encoded message is sent to sendMail
+        and to the messages collection that creates a draft. In the JSON format
+        sendMail wraps the message resource into its own payload, while the
+        draft is the resource itself.
+        """
+        if not self.use_json_api:
+            return self._encode_mime_message(email_message)
+        if for_draft:
+            payload = graph_message(email_message)
+        else:
+            payload = sendmail_payload(email_message)
+        return json.dumps(payload).encode("utf-8")
+
+    def _encode_mime_message(self, email_message: EmailMessage) -> bytes:
         """
         Returns the MIME message of an EmailMessage, base64 encoded.
 
@@ -323,27 +362,35 @@ class MSGraphBackend(BaseEmailBackend):
         at least at their own size, so once they alone reach three quarters of
         the limit the message cannot fit. Checking that first spares a large
         attachment from being encoded only to find out that it has to be
-        uploaded separately anyway. Everything else is measured exactly.
+        uploaded separately anyway. Everything else is measured exactly. This
+        holds for both formats, as JSON carries the attachments base64 encoded
+        as well.
+
+        A backend that always uses sendMail skips the measuring and leaves it
+        to Graph to reject a message that is too large for it.
         """
-        if attachments_size(email_message) * 4 // 3 > self.MAX_SENDMAIL_SIZE:
+        if self.always_use_sendmail:
+            return self._encode_message(email_message)
+        if attachments_size(email_message) * 4 // 3 > self.max_sendmail_size:
             return None
         message = self._encode_message(email_message)
-        if len(message) > self.MAX_SENDMAIL_SIZE:
+        if len(message) > self.max_sendmail_size:
             return None
         return message
 
     def _prepare_draft_message(self, email_message: EmailMessage) -> bytes:
         """
-        Returns the MIME message that creates the draft of a large email.
+        Returns the encoded message that creates the draft of a large email.
 
         The draft holds everything but the attachments, which are uploaded to it
         separately afterwards. Serializing the message once more with its
-        attachments temporarily removed leaves that work to Django.
+        attachments temporarily removed leaves that work to Django, or to the
+        JSON mapping, without either having to know about the omission.
         """
         original_attachments = email_message.attachments
         email_message.attachments = []
         try:
-            return self._encode_message(email_message)
+            return self._encode_message(email_message, for_draft=True)
         finally:
             email_message.attachments = original_attachments
 

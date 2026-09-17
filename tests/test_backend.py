@@ -152,9 +152,9 @@ def encoded_attachment_counts() -> Iterator[list[int]]:
     counts: list[int] = []
     encode_message = MSGraphBackend._encode_message
 
-    def spy(backend, email_message):
+    def spy(backend, email_message, **kwargs):
         counts.append(len(email_message.attachments))
-        return encode_message(backend, email_message)
+        return encode_message(backend, email_message, **kwargs)
 
     with mock.patch.object(MSGraphBackend, "_encode_message", spy):
         yield counts
@@ -246,6 +246,211 @@ class SendMailTests(unittest.TestCase):
 
         with self.assertLogs("msgraphbackend", level="ERROR"):
             self.assertEqual(send(make_message(), graph, fail_silently=True), 0)
+
+
+class JsonSendMailTests(unittest.TestCase):
+    """The same requests, carrying the message as a Graph JSON resource."""
+
+    def test_message_is_sent_as_json_in_one_request(self):
+        graph = FakeGraph()
+        message = EmailMultiAlternatives(
+            subject="Subject",
+            body="Body",
+            from_email="Sender <sender@example.com>",
+            to=["recipient@example.com"],
+            alternatives=[("<p>Body</p>", "text/html")],
+        )
+        message.attach("notes.txt", b"a note", "text/plain")
+
+        self.assertEqual(send(message, graph, use_json_api=True), 1)
+
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
+        request = graph.requests[0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(header_of(request, "Authorization"), "Bearer access-token")
+        self.assertEqual(header_of(request, "Content-Type"), "application/json")
+        payload = payload_of(request)
+        self.assertEqual(list(payload), ["message"])
+        sent = payload["message"]
+        self.assertEqual(sent["subject"], "Subject")
+        self.assertEqual(
+            sent["from"],
+            {"emailAddress": {"address": "sender@example.com", "name": "Sender"}},
+        )
+        self.assertEqual(
+            sent["toRecipients"],
+            [{"emailAddress": {"address": "recipient@example.com"}}],
+        )
+        self.assertEqual(
+            sent["body"], {"contentType": "html", "content": "<p>Body</p>"}
+        )
+        (attachment,) = sent["attachments"]
+        self.assertEqual(attachment["name"], "notes.txt")
+        self.assertEqual(base64.b64decode(attachment["contentBytes"]), b"a note")
+
+    def test_large_message_is_drafted_as_json_without_attachments(self):
+        graph = FakeGraph()
+        message = make_message(
+            ("first.bin", b"\x01" * 2_000_000, "application/octet-stream"),
+            ("second.bin", b"\x02" * 2_000_000, "application/octet-stream"),
+        )
+
+        with encoded_attachment_counts() as counts:
+            self.assertEqual(send(message, graph, use_json_api=True), 1)
+
+        # The attachments alone are too large, so only the draft is encoded.
+        self.assertEqual(counts, [0])
+        self.assertEqual(
+            graph.urls,
+            [
+                MESSAGES_URL,
+                f"{DRAFT_URL}/attachments",
+                f"{DRAFT_URL}/attachments",
+                f"{DRAFT_URL}/send",
+            ],
+        )
+        draft_request = graph.requests[0]
+        self.assertEqual(header_of(draft_request, "Content-Type"), "application/json")
+        # The draft is the message resource itself, not the sendMail payload.
+        draft = payload_of(draft_request)
+        self.assertEqual(draft["subject"], "Subject")
+        self.assertNotIn("message", draft)
+        self.assertNotIn("attachments", draft)
+        self.assertEqual(
+            [
+                payload_of(request)["name"]
+                for request in graph.requests_to(f"{DRAFT_URL}/attachments")
+            ],
+            ["first.bin", "second.bin"],
+        )
+        self.assertEqual(
+            [attachment.filename for attachment in message.attachments],
+            ["first.bin", "second.bin"],
+        )
+
+    def test_json_message_near_the_limit_is_measured_exactly(self):
+        graph = FakeGraph()
+        # A JSON payload carries its attachments base64 encoded as well, so the
+        # attachments alone fill the limit exactly, and the rest of the payload
+        # tips the message over it. Only encoding the whole message shows that.
+        message = make_message(
+            ("first.bin", b"\x01" * 1_312_500, "application/octet-stream"),
+            ("second.bin", b"\x02" * 1_312_500, "application/octet-stream"),
+        )
+
+        with encoded_attachment_counts() as counts:
+            self.assertEqual(send(message, graph, use_json_api=True), 1)
+
+        self.assertEqual(counts, [2, 0])
+        self.assertEqual(graph.urls[0], MESSAGES_URL)
+
+
+class SendMailLimitTests(unittest.TestCase):
+    """The settings that move or remove the limit of the single request."""
+
+    def make_large_message(self) -> EmailMessage:
+        """Returns a message that is too large for the default limit."""
+        return make_message(
+            ("first.bin", b"\x01" * 2_000_000, "application/octet-stream"),
+            ("second.bin", b"\x02" * 2_000_000, "application/octet-stream"),
+        )
+
+    def test_default_limit_is_the_class_attribute(self):
+        self.assertEqual(
+            make_backend().max_sendmail_size, MSGraphBackend.MAX_SENDMAIL_SIZE
+        )
+
+    def test_raised_limit_keeps_a_larger_message_in_one_request(self):
+        graph = FakeGraph()
+        message = self.make_large_message()
+
+        sent = send(message, graph, max_sendmail_size=10_000_000)
+
+        self.assertEqual(sent, 1)
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
+        raw = message_from_bytes(base64.b64decode(graph.requests[0].data))
+        self.assertEqual(
+            [part.get_filename() for part in raw.get_payload()[1:]],
+            ["first.bin", "second.bin"],
+        )
+
+    def test_lowered_limit_sends_a_small_message_as_a_draft(self):
+        graph = FakeGraph()
+        message = make_message(("notes.txt", b"a note", "text/plain"))
+
+        self.assertEqual(send(message, graph, max_sendmail_size=100), 1)
+
+        self.assertEqual(graph.urls[0], MESSAGES_URL)
+        self.assertEqual(graph.urls[-1], f"{DRAFT_URL}/send")
+
+    def test_limit_is_read_from_the_settings(self):
+        graph = FakeGraph()
+
+        with mock.patch(
+            "django.conf.settings.MSGRAPH_MAX_SENDMAIL_SIZE", 10_000_000, create=True
+        ):
+            self.assertEqual(send(self.make_large_message(), graph), 1)
+
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
+
+    def test_always_use_sendmail_skips_the_draft(self):
+        graph = FakeGraph()
+        # Far too large for the limit, yet the message is neither measured nor
+        # sent as a draft.
+        message = make_message(
+            ("huge.bin", b"\x03" * 5_000_000, "application/octet-stream")
+        )
+
+        with encoded_attachment_counts() as counts:
+            self.assertEqual(send(message, graph, always_use_sendmail=True), 1)
+
+        self.assertEqual(counts, [1])
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
+
+    def test_always_use_sendmail_with_json(self):
+        graph = FakeGraph()
+        message = self.make_large_message()
+
+        sent = send(message, graph, use_json_api=True, always_use_sendmail=True)
+
+        self.assertEqual(sent, 1)
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
+        self.assertEqual(
+            [
+                a["name"]
+                for a in payload_of(graph.requests[0])["message"]["attachments"]
+            ],
+            ["first.bin", "second.bin"],
+        )
+
+    def test_always_use_sendmail_surfaces_the_rejection(self):
+        graph = FakeGraph(fail_on="/sendMail")
+
+        with self.assertRaises(urllib.error.HTTPError):
+            send(self.make_large_message(), graph, always_use_sendmail=True)
+
+        # Nothing was drafted, so nothing had to be cleaned up.
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
+
+    def test_always_use_sendmail_is_read_from_the_settings(self):
+        graph = FakeGraph()
+
+        with mock.patch(
+            "django.conf.settings.MSGRAPH_ALWAYS_USE_SENDMAIL", True, create=True
+        ):
+            self.assertEqual(send(self.make_large_message(), graph), 1)
+
+        self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
+
+    def test_json_api_is_read_from_the_settings(self):
+        graph = FakeGraph()
+
+        with mock.patch("django.conf.settings.MSGRAPH_USE_JSON_API", True, create=True):
+            self.assertEqual(send(make_message(), graph), 1)
+
+        self.assertEqual(
+            header_of(graph.requests[0], "Content-Type"), "application/json"
+        )
 
 
 class SendLargeMailTests(unittest.TestCase):
