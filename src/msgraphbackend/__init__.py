@@ -297,14 +297,23 @@ class MSGraphBackend(BaseEmailBackend):
         }
 
     def _encode_message(self, email_message: EmailMessage) -> bytes:
-        """Returns the MIME message of an EmailMessage, base64 encoded."""
+        """
+        Returns the MIME message of an EmailMessage, base64 encoded.
+
+        The message is serialized with the CRLF line endings that RFC 5322
+        requires, because Exchange does not decode a quoted-printable soft
+        line break that ends in a bare LF: the `=` stays in the text and the
+        character after it is lost.
+        """
         if DJANGO_VERSION >= (6, 0):
             from email.policy import SMTPUTF8
 
             return base64.b64encode(
                 email_message.message(policy=SMTPUTF8).as_bytes()  # pyrefly: ignore
             )
-        return base64.b64encode(email_message.message().as_bytes())
+        return base64.b64encode(
+            email_message.message().as_bytes(linesep="\r\n")  # pyrefly: ignore
+        )
 
     def _encode_for_sendmail(self, email_message: EmailMessage) -> bytes | None:
         """

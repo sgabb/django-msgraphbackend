@@ -194,6 +194,29 @@ class SendMailTests(unittest.TestCase):
         self.assertEqual(counts, [1])
         self.assertEqual(graph.urls, [f"{USER_URL}/sendMail"])
 
+    def test_message_is_sent_with_crlf_line_endings(self):
+        # A line longer than 998 bytes makes Django encode the text parts as
+        # quoted-printable, and Exchange decodes the soft line breaks of that
+        # encoding only when they end in CRLF.
+        graph = FakeGraph()
+        text = "<p>" + "word " * 300 + "</p>"
+        message = EmailMultiAlternatives(
+            subject="Subject",
+            body=text,
+            from_email="sender@example.com",
+            to=["recipient@example.com"],
+            alternatives=[(text, "text/html")],
+        )
+
+        self.assertEqual(send(message, graph), 1)
+
+        raw = base64.b64decode(graph.requests[0].data)
+        self.assertEqual(raw.replace(b"\r\n", b"").count(b"\n"), 0)
+        plain, html = message_from_bytes(raw).get_payload()
+        for part in (plain, html):
+            self.assertEqual(part["Content-Transfer-Encoding"], "quoted-printable")
+            self.assertEqual(body_of(part), text.encode("utf-8"))
+
     def test_sender_is_looked_up_when_no_user_id_is_configured(self):
         graph = FakeGraph()
 
