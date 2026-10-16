@@ -99,13 +99,47 @@ The *Microsoft Graph Backend for Django* requires the following settings:
 |-----------------------|----------|-------------|
 | MSGRAPH_TENANT_ID     | Yes      | Your [Microsoft Entra tenant ID](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-find-tenant). |
 | MSGRAPH_CLIENT_ID     | Yes      | The [application (client) ID](https://learn.microsoft.com/en-us/graph/auth-register-app-v2) of your Microsoft Entra app. |
-| MSGRAPH_CLIENT_SECRET | Yes      | The secret to your Microsoft Entra application. |
+| MSGRAPH_CLIENT_SECRET | Yes, or a certificate | The secret to your Microsoft Entra application. |
+| MSGRAPH_CLIENT_CERTIFICATE | Yes, or a secret | The PKCS#12 (`.pfx`) certificate of your Microsoft Entra application, base64 encoded. See [Certificate Credentials](#certificate-credentials). |
+| MSGRAPH_CLIENT_CERTIFICATE_PATH | No | The path to the `.pfx` file, as an alternative to `MSGRAPH_CLIENT_CERTIFICATE`. |
+| MSGRAPH_CLIENT_CERTIFICATE_PASSWORD | No | The password that opens the `.pfx` file. |
 | MSGRAPH_USER_ID       | No       | If you grant your application the `User.Read.All` application permission, this setting is not required. |
 | MSGRAPH_USE_JSON_API  | No       | Send emails as the Microsoft Graph-typical JSON `message` resource instead of MIME content. Defaults to `False`. See [Message Format](#message-format). |
 | MSGRAPH_MAX_SENDMAIL_SIZE | No   | The size in bytes up to which an encoded email is sent in a single `sendMail` request. Defaults to `3500000`. See [Large Emails](#large-emails). |
 | MSGRAPH_ALWAYS_USE_SENDMAIL | No | Send every email in a single `sendMail` request, regardless of its size. Defaults to `False`. See [Large Emails](#large-emails). |
 
 
+
+## Certificate Credentials
+Instead of a client secret, the backend can authenticate with a certificate: it
+signs a short-lived JWT (a *client assertion*) with the private key, and
+Microsoft Entra checks it against the public certificate uploaded to the app
+registration. The private key never leaves your server. This needs the
+`cryptography` package:
+
+```bash
+pip install "django-msgraphbackend[certificate]"
+```
+
+Upload the public certificate (`.cer`, `.pem` or `.crt`) to the app
+registration under *Certificates & secrets*, and give the backend the PKCS#12
+file, which holds the key and the certificate together. To fit it in an
+environment variable, base64 encode it on one line:
+
+```bash
+base64 -w0 certificate.pfx
+```
+
+```python
+MSGRAPH_CLIENT_CERTIFICATE = os.environ["MSGRAPH_CLIENT_CERTIFICATE"]
+MSGRAPH_CLIENT_CERTIFICATE_PASSWORD = os.environ["MSGRAPH_CLIENT_CERTIFICATE_PASSWORD"]
+```
+
+or point `MSGRAPH_CLIENT_CERTIFICATE_PATH` at the file, for instance a Docker
+secret. When both a certificate and a secret are configured, the certificate
+is used. The certificate must hold an RSA key; a wrong password or an
+unreadable file raises `ImproperlyConfigured` when the backend is created, and
+an expired certificate is logged as a warning.
 
 ## Modes of Operation
 

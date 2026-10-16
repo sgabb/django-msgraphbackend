@@ -38,7 +38,7 @@ jobs:
         ruff format --check
     - name: Test
       run: |
-        pip install -e .
+        pip install -e .[certificate]
         python -m unittest discover --verbose
     - name: Build
       run: |

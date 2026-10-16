@@ -21,6 +21,7 @@ from .attachments import (
     iter_attachments,
     iter_chunks,
 )
+from .certificate import CLIENT_ASSERTION_TYPE, ClientCertificate
 from .message import graph_message, sendmail_payload
 
 if TYPE_CHECKING:
@@ -76,6 +77,8 @@ class MSGraphBackend(BaseEmailBackend):
         tenant_id: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
+        client_certificate: bytes | str | None = None,
+        client_certificate_password: str | None = None,
         user_id: str | None = None,
         use_json_api: bool = False,
         max_sendmail_size: int | None = None,
@@ -88,11 +91,19 @@ class MSGraphBackend(BaseEmailBackend):
             raise ImproperlyConfigured("The MSGRAPH_TENANT_ID setting must be set.")
         if not client_id and not hasattr(settings, "MSGRAPH_CLIENT_ID"):
             raise ImproperlyConfigured("The MSGRAPH_CLIENT_ID setting must be set.")
-        if not client_secret and not hasattr(settings, "MSGRAPH_CLIENT_SECRET"):
-            raise ImproperlyConfigured("The MSGRAPH_CLIENT_SECRET setting must be set.")
         self.tenant_id = tenant_id or settings.MSGRAPH_TENANT_ID
         self.client_id = client_id or settings.MSGRAPH_CLIENT_ID
-        self.client_secret = client_secret or settings.MSGRAPH_CLIENT_SECRET
+        self.client_secret = client_secret or getattr(
+            settings, "MSGRAPH_CLIENT_SECRET", None
+        )
+        self.client_certificate = self._load_certificate(
+            client_certificate, client_certificate_password
+        )
+        if not self.client_secret and not self.client_certificate:
+            raise ImproperlyConfigured(
+                "Either the MSGRAPH_CLIENT_SECRET or the MSGRAPH_CLIENT_CERTIFICATE "
+                "(or MSGRAPH_CLIENT_CERTIFICATE_PATH) setting must be set."
+            )
         self.user_id = getattr(settings, "MSGRAPH_USER_ID", user_id)
         self.use_json_api = getattr(settings, "MSGRAPH_USE_JSON_API", use_json_api)
         self.max_sendmail_size = (
@@ -105,20 +116,59 @@ class MSGraphBackend(BaseEmailBackend):
         self._token: MSGraphToken | None = None
         self.open()
 
+    @staticmethod
+    def _load_certificate(
+        certificate: bytes | str | None, password: str | None
+    ) -> ClientCertificate | None:
+        """
+        Reads the certificate credentials, if any, from the arguments or else
+        from the settings.
+
+        The certificate is a PKCS#12 file: its contents as bytes, or base64
+        encoded as a string, which is how it fits in an environment variable.
+        A path to the file is the alternative for a file mounted into the
+        container.
+        """
+        password = password or getattr(
+            settings, "MSGRAPH_CLIENT_CERTIFICATE_PASSWORD", None
+        )
+        if certificate is None:
+            certificate = getattr(settings, "MSGRAPH_CLIENT_CERTIFICATE", None)
+        if isinstance(certificate, bytes):
+            return ClientCertificate.from_pfx(certificate, password)
+        if certificate:
+            return ClientCertificate.from_base64(certificate, password)
+        path = getattr(settings, "MSGRAPH_CLIENT_CERTIFICATE_PATH", None)
+        if path:
+            try:
+                with open(path, "rb") as file:
+                    return ClientCertificate.from_pfx(file.read(), password)
+            except OSError as err:
+                raise ImproperlyConfigured(
+                    f"The Microsoft Graph client certificate {path} cannot be read."
+                ) from err
+        return None
+
     def open(self) -> bool | None:
         """Gets a Microsoft Graph API token."""
         if self._token and self._token.is_valid:
             return True
         url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        data = urllib.parse.urlencode(
-            {
-                "client_id": self.client_id,
-                "scope": "https://graph.microsoft.com/.default",
-                "client_secret": self.client_secret,
-                "grant_type": "client_credentials",
-            }
-        ).encode("utf-8")
+        form = {
+            "client_id": self.client_id,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        }
+        # The certificate wins when both credentials are configured.
+        if self.client_certificate:
+            form["client_assertion_type"] = CLIENT_ASSERTION_TYPE
+            form["client_assertion"] = self.client_certificate.client_assertion(
+                self.client_id, url
+            )
+        else:
+            form["client_secret"] = self.client_secret
+        data = urllib.parse.urlencode(form).encode("utf-8")
         request = urllib.request.Request(url, data, headers)
         response = self._urlopen(request, "Failed to obtain Microsoft Graph API token.")
         if response is None:
